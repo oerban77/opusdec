@@ -11,6 +11,7 @@ import logging
 import os
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -20,16 +21,25 @@ from opus2gh.opus_codec import FFMPEG, OPUS_SR
 logger = logging.getLogger('opus2gh.player')
 
 THIS_DIR = Path(__file__).resolve().parent.parent
+if getattr(sys, 'frozen', False):
+    THIS_DIR = Path(sys.executable).resolve().parent
 FFPLAY = FFMPEG.replace('ffmpeg', 'ffplay')
 
 
 def _find_ffplay() -> str:
-    """Cari ffplay di folder yang sama dengan ffmpeg."""
+    """Cari ffplay di folder yang sama dengan ffmpeg (termasuk saat frozen)."""
     d = os.path.dirname(FFMPEG)
     for name in ('ffplay.exe', 'ffplay'):
         p = os.path.join(d, name)
         if os.path.isfile(p):
             return p
+    # Saat frozen, binary di-extract ke _MEIPASS/bin
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        for name in ('ffplay.exe', 'ffplay'):
+            p = os.path.join(meipass, 'bin', name)
+            if os.path.isfile(p):
+                return p
     return 'ffplay'
 
 

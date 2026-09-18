@@ -218,22 +218,26 @@ class GitHubExporter:
 
     def list_repo_songs(self, music_dir: str = 'music') -> list[dict]:
         """
-        Daftar lagu di repo (folder music_dir).
-        Return list {filename, title, channel, dur_s, size_kb, sha}
+        Daftar lagu di repo (folder music_dir), lengkap dengan metadata
+        yang diambil dari .meta.json di repo.
+
+        Return list {vid_id, path, sha, size_kb, title, channel, dur_s,
+                     duration_str, has_meta}
         """
         self._ensure_repo_ready()
         tree = self._api('GET', f'git/trees/{self.branch}?recursive=1')
 
-        songs = []
+        prefix = f'{music_dir}/'
+        streams: dict[str, dict] = {}   # vid_id -> info dasar
+        metas: dict[str, str] = {}      # vid_id -> blob sha meta
         for item in tree.get('tree', []):
             path = item.get('path', '')
-            if not path.startswith(f'{music_dir}/'):
+            if not path.startswith(prefix) or item.get('type') != 'blob':
                 continue
-            if item.get('type') != 'blob':
-                continue
-            if path.endswith('.opus_stream'):
-                vid_id = path.split('/')[-1][:-len('.opus_stream')]
-                songs.append({
+            name = path[len(prefix):]
+            if name.endswith('.opus_stream'):
+                vid_id = name[:-len('.opus_stream')]
+                streams[vid_id] = {
                     'vid_id': vid_id,
                     'path': path,
                     'sha': item.get('sha', ''),
@@ -241,7 +245,35 @@ class GitHubExporter:
                     'title': vid_id,
                     'channel': '',
                     'dur_s': 0,
-                })
+                    'has_meta': False,
+                }
+            elif name.endswith('.meta.json'):
+                metas[name[:-len('.meta.json')]] = item.get('sha', '')
+
+        # Ambil metadata dari blob .meta.json di repo
+        for vid_id, sha in metas.items():
+            if vid_id not in streams:
+                continue
+            try:
+                blob = self._api('GET', f'git/blobs/{sha}')
+                raw = base64.b64decode(blob.get('content', '') or '')
+                meta = json.loads(raw.decode('utf-8'))
+                streams[vid_id]['title'] = meta.get('title') or vid_id
+                streams[vid_id]['channel'] = (meta.get('artist')
+                                              or meta.get('channel') or '')
+                streams[vid_id]['dur_s'] = int(meta.get('dur_s')
+                                               or meta.get('duration') or 0)
+                streams[vid_id]['has_meta'] = True
+            except Exception as e:
+                logger.warning("Gagal baca meta %s: %s", vid_id, e)
+
+        songs = []
+        for vid_id in sorted(streams):
+            s = streams[vid_id]
+            dur = s['dur_s']
+            s['duration_str'] = (f"{dur // 60}:{dur % 60:02d}"
+                                 if dur else '-')
+            songs.append(s)
         return songs
 
     # ── Catalog ─────────────────────────────────────────────
@@ -467,13 +499,25 @@ class GitHubExporter:
         return commit.get('sha', '')
 
     def delete_song(self, repo_path: str, commit_message: str | None = None) -> dict:
-        """Hapus file dari repo. Return {ok, commit_sha}."""
+        """
+        Hapus file dari repo.
+
+        Return {ok, skipped, commit_sha}:
+        - ok=True, skipped=False → berhasil di-commit
+        - ok=False, skipped=True → file memang tidak ada di repo (bukan
+          error, aman diabaikan saat meta.json belum pernah di-upload)
+        """
         self._ensure_repo_ready()
 
         # Ambil sha file
-        info = self._api('GET', f'contents/{repo_path}?ref={self.branch}')
+        try:
+            info = self._api('GET', f'contents/{repo_path}?ref={self.branch}')
+        except GitHubError as e:
+            if e.code == 404:
+                return {'ok': False, 'skipped': True, 'commit_sha': ''}
+            raise
         if not isinstance(info, dict) or not info.get('sha'):
-            raise GitHubError(f"File '{repo_path}' tidak ditemukan di repo")
+            return {'ok': False, 'skipped': True, 'commit_sha': ''}
 
         body = {
             'message': commit_message or f"music: delete {repo_path}",
@@ -482,4 +526,17 @@ class GitHubExporter:
         }
         result = self._api('DELETE', f'contents/{repo_path}', body)
         commit = result.get('commit', {})
-        return {'ok': True, 'commit_sha': commit.get('sha', '')}
+        return {'ok': True, 'skipped': False, 'commit_sha': commit.get('sha', '')}
+
+    def get_catalog(self, catalog_path: str = 'catalog.json') -> dict | None:
+        """Baca catalog.json dari repo (ada di root repo). None jika belum ada / gagal parse."""
+        raw = self._get_repo_blob(catalog_path)
+        if raw is None:
+            return None
+        try:
+            catalog = json.loads(raw.decode('utf-8'))
+            if isinstance(catalog, dict) and 'tracks' in catalog:
+                return catalog
+        except Exception as e:
+            logger.warning("Gagal parse catalog.json: %s", e)
+        return None

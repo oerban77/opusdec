@@ -18,9 +18,12 @@ import platform
 import shutil
 import struct
 import subprocess
+import sys
 from pathlib import Path
 
 logger = logging.getLogger('opus2gh.codec')
+
+system = platform.system()
 
 # ── Konfigurasi codec ─────────────────────────────────────────
 OPUS_BITRATE = 16000          # 16 kbps (sesuai permintaan)
@@ -29,12 +32,23 @@ FRAME_SAMPLES = 960           # 60 ms @ 16 kHz
 FRAME_BYTES = FRAME_SAMPLES * 2
 
 
+def _bundled_bin_dir() -> str | None:
+    """Saat frozen (PyInstaller onefile), binary ada di sys._MEIPASS/bin."""
+    base = getattr(sys, '_MEIPASS', None)
+    if base:
+        return os.path.join(base, 'bin')
+    return None
+
+
 def find_ffmpeg() -> str:
     """Cari executable ffmpeg di lokasi umum, fallback ke PATH."""
     this_dir = Path(__file__).resolve().parent.parent
-    system = platform.system()
+    bundled = _bundled_bin_dir()
     if system == 'Windows':
-        candidates = [
+        candidates = []
+        if bundled:
+            candidates.append(os.path.join(bundled, 'ffmpeg.exe'))
+        candidates += [
             r'D:\master\ffmpeg-8.1-full_build\bin\ffmpeg.exe',
             r'D:\master\tools\ffmpeg\bin\ffmpeg.exe',
             r'C:\ffmpeg\bin\ffmpeg.exe',
@@ -42,7 +56,10 @@ def find_ffmpeg() -> str:
             str(this_dir / 'ffmpeg' / 'ffmpeg.exe'),
         ]
     else:
-        candidates = [
+        candidates = []
+        if bundled:
+            candidates.append(os.path.join(bundled, 'ffmpeg'))
+        candidates += [
             '/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg',
             '/opt/homebrew/bin/ffmpeg',
             str(this_dir / 'ffmpeg' / 'ffmpeg'),
@@ -59,7 +76,11 @@ FFMPEG = find_ffmpeg()
 def _find_opus_dll_dirs() -> list[str]:
     """Cari folder yang berisi opus.dll / libopus (untuk opuslib via ctypes)."""
     this_dir = Path(__file__).resolve().parent.parent
-    candidates = [
+    bundled = _bundled_bin_dir()
+    candidates = []
+    if bundled:
+        candidates.append(bundled)
+    candidates += [
         str(this_dir / 'ffmpeg' / 'bin'),
         str(this_dir / 'opus'),
         r'D:\master\tools\wireshark-portable\app',

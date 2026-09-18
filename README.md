@@ -12,6 +12,14 @@ lalu mengekspornya beserta metadata-nya ke GitHub repository.
   didownload & dikonversi (16 kHz mono, frame 60 ms)
 - ⬆ **Export ke GitHub** — lagu (`.opus_stream`) + metadata (`.meta.json`)
   di-commit ke repo via GitHub REST API
+- ☁ **Repo GitHub tab** — kelola repo musik langsung dari aplikasi:
+  - 🔄 **Daftar Lagu di Repo** — ambil semua lagu + metadata dari repo,
+    yang sudah ada di lokal ditandai ✅
+  - 🗑 **Hapus dari Repo** — hapus `.opus_stream` + `.meta.json` terpilih,
+    `catalog.json` di-sync ulang otomatis
+  - ⬇ **Import ke Lokal** — download ulang lagu dari repo ke `music/`
+  - 📋 **Sync Catalog** — bangun ulang `catalog.json` (di root repo) dari
+    semua lagu di folder `music/`
 - ⚙ **Settings** — kredensial GitHub (PAT, owner, repo, branch) dengan
   tombol **Test Koneksi**
 
@@ -68,6 +76,33 @@ music/                  # Cache lokal lagu hasil konversi
 Jika pencarian/download gagal karena verifikasi YouTube, letakkan
 `cookies.txt` di folder project (export dari browser Chrome/Firefox
 menggunakan extension **"Get cookies.txt LOCALLY"**).
+
+## Build menjadi satu file EXE (standalone)
+
+Semua dependency — Python, modul `opus2gh`, `ffmpeg`/`ffplay`/`ffprobe`
++ DLL-nya, dan `opus.dll` untuk opuslib — di-bundle menjadi **satu** file
+`opus2gh.exe` tanpa folder `_internal`:
+
+```bash
+build_onefile.bat
+```
+
+Hasil: `dist\opus2gh.exe` (~138 MB). File ini bisa di-copy ke folder mana
+saja dan dijalankan langsung di Windows tanpa install apa pun.
+
+Yang **tetap di luar** exe (dibuat otomatis di samping exe saat dijalankan):
+
+| File/Folder | Isi |
+|---|---|
+| `settings.json` | Konfigurasi GitHub (token, owner, repo, branch) |
+| `music/` | Cache lagu hasil konversi |
+| `catalog.json` | Hasil sync katalog repo (berada di **root repo**,
+bukan di folder `music/`) |
+| `cookies.txt` | Opsional, anti-bot YouTube |
+
+> Jika lokasi `ffmpeg` atau `opus.dll` berbeda, set environment variable
+> `FFMPEG_BIN` dan `OPUS_DLL` sebelum build, atau edit path di
+> `opus2gh_onefile.spec`.
 
 ## Catatan
 

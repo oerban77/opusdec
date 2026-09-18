@@ -69,11 +69,14 @@ class App(tk.Tk):
         self.search_results: list[dict] = []
         self.local_songs: list[dict] = []      # lagu lokal di folder music/
         self.converted: dict[str, dict] = {}   # vid_id → {opus_file, meta_file, meta}
+        self.repo_songs: list[dict] = []       # lagu di repo GitHub (tab Import)
         # Sort state
         self.results_sort_key: str | None = None
         self.results_sort_reverse: bool = False
         self.local_sort_key: str | None = None
         self.local_sort_reverse: bool = False
+        self.repo_sort_key: str | None = None
+        self.repo_sort_reverse: bool = False
         self.worker: threading.Thread | None = None
         self.busy = False
         self.stop_flag = threading.Event()    # stop pencarian / operasi
@@ -206,6 +209,67 @@ class App(tk.Tk):
         self.local_tree.bind('<Double-Button-1>',
                              self._on_local_double_click)
 
+        # Tab 3: Import / Kelola Repo GitHub
+        repo_tab = ttk.Frame(self.notebook, padding=(10, 6))
+        self.notebook.add(repo_tab, text="☁ Repo GitHub")
+        repo_tab.columnconfigure(0, weight=1)
+        repo_tab.rowconfigure(3, weight=1)
+
+        repo_header = ttk.Frame(repo_tab)
+        repo_header.grid(row=0, column=0, columnspan=2, sticky='ew',
+                         pady=(0, 2))
+        self.repo_refresh_btn = ttk.Button(
+            repo_header, text="🔄 Daftar Lagu di Repo",
+            command=self._do_repo_list)
+        self.repo_refresh_btn.pack(side='left')
+        self.repo_delete_btn = ttk.Button(
+            repo_header, text="🗑 Hapus dari Repo",
+            command=self._do_repo_delete, state='disabled')
+        self.repo_delete_btn.pack(side='left', padx=(6, 0))
+        self.repo_import_btn = ttk.Button(
+            repo_header, text="⬇ Import ke Lokal",
+            command=self._do_repo_import, state='disabled')
+        self.repo_import_btn.pack(side='left', padx=(6, 0))
+        self.repo_count_var = tk.StringVar(value="0 lagu")
+        ttk.Label(repo_header, textvariable=self.repo_count_var,
+                  foreground='gray').pack(side='left', padx=8)
+
+        ttk.Label(repo_tab, foreground='gray',
+                  text="Kelola lagu di repo GitHub — hapus, import ulang "
+                       "ke folder music/, atau sinkronkan catalog.json."
+                  ).grid(row=1, column=0, columnspan=2, sticky='w',
+                         pady=(4, 2))
+
+        # Status sinkron catalog
+        self.catalog_status_var = tk.StringVar(value="catalog.json: belum dicek")
+        ttk.Label(repo_tab, textvariable=self.catalog_status_var,
+                  foreground='gray').grid(row=2, column=0, columnspan=2,
+                                          sticky='w', pady=(2, 4))
+
+        rcols = ('title', 'channel', 'duration', 'size')
+        self.repo_tree = ttk.Treeview(repo_tab, columns=rcols,
+                                      show='headings', selectmode='extended')
+        self.repo_tree.heading('title', text='Judul',
+                               command=lambda: self._sort_repo('title'))
+        self.repo_tree.heading('channel', text='Channel',
+                               command=lambda: self._sort_repo('channel'))
+        self.repo_tree.heading('duration', text='Durasi',
+                               command=lambda: self._sort_repo('duration'))
+        self.repo_tree.heading('size', text='Ukuran',
+                               command=lambda: self._sort_repo('size'))
+        self.repo_tree.column('title', width=380, anchor='w')
+        self.repo_tree.column('channel', width=160, anchor='w')
+        self.repo_tree.column('duration', width=70, anchor='center')
+        self.repo_tree.column('size', width=80, anchor='e')
+        self.repo_tree.grid(row=3, column=0, sticky='nsew')
+
+        rscroll = ttk.Scrollbar(repo_tab, orient='vertical',
+                                command=self.repo_tree.yview)
+        self.repo_tree.configure(yscrollcommand=rscroll.set)
+        rscroll.grid(row=3, column=1, sticky='ns')
+
+        self.repo_tree.bind('<<TreeviewSelect>>', self._on_repo_selection_changed)
+
         # Progress + status
         status_frame = ttk.Frame(self, padding=(10, 4))
         status_frame.pack(fill='x')
@@ -221,12 +285,19 @@ class App(tk.Tk):
         self.export_btn = ttk.Button(status_frame, text="⬆ Export Terpilih",
                                      command=self._do_export, state='disabled')
         self.export_btn.pack(side='right')
+        self.catalog_sync_btn = ttk.Button(
+            status_frame, text="📋 Sync Catalog",
+            command=self._do_catalog_sync, state='disabled')
+        self.catalog_sync_btn.pack(side='right', padx=(0, 6))
         self.play_stop_btn = ttk.Button(status_frame, text="⏹ Stop Musik",
                                         command=self._do_stop_play,
                                         state='disabled')
         self.play_stop_btn.pack(side='right', padx=(0, 6))
 
-        self.progress = ttk.Progressbar(self, mode='indeterminate')
+        # Idle = determinate value 0 (trough abu-abu terlihat "kosong").
+        # Mode indeterminate di tema vista punya trough biru muda yang
+        # terlihat "terisi" walau animasi sudah di-stop.
+        self.progress = ttk.Progressbar(self, mode='determinate', value=0)
         self.progress.pack(fill='x', padx=10, pady=(0, 4))
 
         # Log
@@ -263,18 +334,19 @@ class App(tk.Tk):
             if status:
                 self.status_var.set(status)
             if busy:
+                self.progress.config(mode='indeterminate')
                 self.progress.start(12)
             else:
-                # stop() saja sering meninggalkan bar terisi di mode
-                # indeterminate (Windows) → reset value & mode eksplisit
+                # stop() meninggalkan trough biru mode indeterminate terlihat
+                # terisi → kembalikan ke determinate value 0 (abu-abu kosong)
                 self.progress.stop()
                 self.progress.config(mode='determinate')
                 self.progress['value'] = 0
-                self.progress.config(mode='indeterminate')
         self.after(0, _set)
 
     def _update_buttons(self):
         """Update state semua tombol sesuai kondisi (busy, hasil, converted)."""
+        cfg = self.settings
         self.search_btn.configure(
             state='disabled' if self.busy else 'normal')
         self.stop_btn.configure(
@@ -285,6 +357,22 @@ class App(tk.Tk):
         has_songs = bool(self.converted) or bool(self.local_songs)
         self.export_btn.configure(
             state='disabled' if (self.busy or not has_songs) else 'normal')
+        # Sync catalog & daftar repo: butuh settings GitHub lengkap
+        gh_ready = bool(cfg.get('github_token')
+                        and cfg.get('github_owner')
+                        and cfg.get('github_repo'))
+        self.catalog_sync_btn.configure(
+            state='disabled' if (self.busy or not gh_ready) else 'normal')
+        self.repo_refresh_btn.configure(
+            state='disabled' if (self.busy or not gh_ready) else 'normal')
+        # Hapus / import di tab repo: butuh selection + settings + tidak sibuk
+        repo_sel = bool(self.repo_tree.selection())
+        self.repo_delete_btn.configure(
+            state='normal' if (repo_sel and gh_ready and not self.busy)
+            else 'disabled')
+        self.repo_import_btn.configure(
+            state='normal' if (repo_sel and gh_ready and not self.busy)
+            else 'disabled')
         # Player: tombol stop aktif jika sedang memutar
         self.play_stop_btn.configure(
             state='normal' if player.playing else 'disabled')
@@ -538,6 +626,322 @@ class App(tk.Tk):
                         + (f", {fail} gagal" if fail else ""))
         self._refresh_local_list()
 
+    # ── Repo GitHub (tab Import) ─────────────────────────────
+    def _on_repo_selection_changed(self, _event=None):
+        """Selection di tab repo berubah → update tombol."""
+        self._update_buttons()
+        n = len(self.repo_tree.selection())
+        if n == 1:
+            self.status_var.set("1 lagu repo dipilih — Hapus / Import")
+        elif n > 1:
+            self.status_var.set(f"{n} lagu repo dipilih — Hapus / Import")
+
+    def _render_repo_list(self, keep_selection=True):
+        """Render ulang tree tab Repo GitHub dari self.repo_songs."""
+        sel = set(self.repo_tree.selection()) if keep_selection else set()
+        for iid in self.repo_tree.get_children():
+            self.repo_tree.delete(iid)
+        for r in self.repo_songs:
+            # Tandai yang sudah ada di lokal (✅)
+            prefix = "✅ " if (MUSIC_DIR / f"{r['vid_id']}.opus_stream"
+                              ).exists() else ""
+            self.repo_tree.insert(
+                '', 'end', iid=r['vid_id'],
+                values=(prefix + r['title'], r['channel'],
+                        r['duration_str'], f"{r['size_kb']} KB"))
+        valid_sel = sel & set(self.repo_tree.get_children())
+        if valid_sel:
+            self.repo_tree.selection_set(list(valid_sel))
+        self._update_buttons()
+
+    def _do_repo_list(self):
+        """Ambil daftar lagu dari repo GitHub + status catalog.json."""
+        if self.busy:
+            return
+        cfg = self.settings
+        if not (cfg.get('github_token') and cfg.get('github_owner')
+                and cfg.get('github_repo')):
+            messagebox.showwarning(
+                "Settings belum lengkap",
+                "Isi GitHub token, owner, dan repo di Settings dulu.")
+            self._open_settings()
+            return
+
+        repo_dir = cfg.get('repo_dir', 'music')
+
+        def _task():
+            self.log(f"☁ Mengambil daftar lagu dari "
+                     f"{cfg['github_owner']}/{cfg['github_repo']}...")
+            self.set_status("☁ Mengambil daftar lagu dari repo...")
+            try:
+                exporter = GitHubExporter(
+                    token=cfg['github_token'],
+                    owner=cfg['github_owner'],
+                    repo=cfg['github_repo'],
+                    branch=cfg.get('github_branch', 'main'),
+                )
+                songs = exporter.list_repo_songs(repo_dir)
+                self.repo_songs = songs
+                self.after(0, self._render_repo_list)
+                n = len(songs)
+                self.notebook.tab(2, text=f"☁ Repo GitHub ({n})")
+                self.repo_count_var.set(f"{n} lagu di repo")
+                self.log(f"✅ {n} lagu ditemukan di repo")
+
+                # Cek status catalog.json (ada di root repo, bukan di repo_dir)
+                cat = exporter.get_catalog('catalog.json')
+                if cat is None:
+                    self.catalog_status_var.set(
+                        "catalog.json: belum ada di repo — klik Sync Catalog")
+                    self.log("⚠ catalog.json belum ada di repo")
+                else:
+                    ccount = cat.get('count', 0)
+                    if ccount == n:
+                        self.catalog_status_var.set(
+                            f"catalog.json: sinkron ({ccount} tracks)")
+                        self.log(f"📋 catalog.json sinkron ({ccount} tracks)")
+                    else:
+                        self.catalog_status_var.set(
+                            f"catalog.json: TERLALU LAMA — {ccount} tracks, "
+                            f"repo {n} lagu → klik Sync Catalog")
+                        self.log(f"⚠ catalog.json tidak sinkron: {ccount} "
+                                 f"tracks vs {n} lagu di repo")
+                self.set_status(f"{n} lagu di repo — pilih untuk "
+                                f"Hapus / Import")
+            except GitHubRepoNotFoundError as e:
+                self.log(f"❌ Repo tidak ditemukan: {e}")
+                self.set_status("Repo tidak ditemukan — cek Settings")
+            except GitHubError as e:
+                self.log(f"❌ Gagal mengambil daftar: {e}")
+                self.set_status("Gagal mengambil daftar lagu")
+
+        self.run_async(_task)
+
+    def _do_repo_delete(self):
+        """Hapus lagu terpilih dari repo GitHub, lalu sync catalog."""
+        if self.busy:
+            return
+        sel = self.repo_tree.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Pilih lagu di tab 'Repo GitHub' "
+                                "yang mau dihapus dari repo.")
+            return
+        cfg = self.settings
+        repo_dir = cfg.get('repo_dir', 'music')
+
+        names = []
+        for vid_id in sel:
+            r = next((x for x in self.repo_songs
+                      if x['vid_id'] == vid_id), None)
+            names.append(r['title'] if r else vid_id)
+        preview = "\n".join(f"• {n[:50]}" for n in names[:5])
+        more = f"\n... dan {len(names) - 5} lainnya" if len(names) > 5 else ""
+
+        if not messagebox.askyesno(
+                "Hapus dari repo GitHub",
+                f"Hapus {len(names)} lagu dari repo GitHub?\n\n"
+                f"{preview}{more}\n\n"
+                "File .opus_stream + .meta.json akan di-commit sebagai "
+                "penghapusan. catalog.json akan di-sync ulang otomatis."):
+            return
+
+        n = len(sel)
+
+        def _task():
+            exporter = GitHubExporter(
+                token=cfg['github_token'],
+                owner=cfg['github_owner'],
+                repo=cfg['github_repo'],
+                branch=cfg.get('github_branch', 'main'),
+            )
+            ok, fail = 0, 0
+            for i, vid_id in enumerate(sel, 1):
+                r = next((x for x in self.repo_songs
+                          if x['vid_id'] == vid_id), None)
+                if not r:
+                    continue
+                title = r.get('title', vid_id)
+                self.set_status(f"🗑 Hapus {i}/{n}: {title[:50]}...")
+                # Hapus opus_stream + meta.json
+                both_ok = True
+                for ext in ('.opus_stream', '.meta.json'):
+                    path = f"{repo_dir}/{vid_id}{ext}"
+                    try:
+                        res = exporter.delete_song(
+                            path, commit_message=f"music: delete {vid_id}{ext}")
+                        if res.get('skipped'):
+                            # File memang tidak ada di repo (mis. meta.json
+                            # belum pernah di-upload) → bukan kegagalan
+                            continue
+                    except GitHubError as e:
+                        self.log(f"❌ Gagal hapus {path}: {e}")
+                        both_ok = False
+                if both_ok:
+                    ok += 1
+                    self.log(f"🗑 Dihapus: {title[:60]}")
+                else:
+                    fail += 1
+
+            # Sync ulang catalog.json di repo
+            if ok:
+                try:
+                    self.set_status("📋 Sinkron catalog.json...")
+                    cat = exporter.sync_catalog(
+                        repo_dir=repo_dir,
+                        catalog_path='catalog.json',
+                        local_file=str(BASE_DIR / 'catalog.json'),
+                        commit_message=f"catalog: sync after delete "
+                                       f"({ok} removed)",
+                    )
+                    self.log(f"📋 catalog.json di-sync: {cat['count']} lagu")
+                except Exception as e:
+                    self.log(f"⚠ Sinkron catalog gagal: {e}")
+
+            # Refresh daftar repo
+            try:
+                songs = exporter.list_repo_songs(repo_dir)
+                self.repo_songs = songs
+                self.after(0, self._render_repo_list)
+                self.notebook.tab(2, text=f"☁ Repo GitHub ({len(songs)})")
+                self.repo_count_var.set(f"{len(songs)} lagu di repo")
+            except Exception as e:
+                self.log(f"⚠ Gagal refresh daftar repo: {e}")
+
+            self.set_status(f"🗑 {ok} dihapus dari repo"
+                            + (f", {fail} gagal" if fail else ""))
+            self.log(f"🎉 Hapus selesai: {ok} dihapus, {fail} gagal")
+
+        self.run_async(_task)
+
+    def _do_repo_import(self):
+        """Import ulang lagu terpilih dari repo ke folder music/ lokal."""
+        if self.busy:
+            return
+        sel = self.repo_tree.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Pilih lagu di tab 'Repo GitHub' "
+                                "yang mau di-import ke lokal.")
+            return
+        cfg = self.settings
+        repo_dir = cfg.get('repo_dir', 'music')
+
+        # Saring yang sudah ada lokal
+        to_import = [v for v in sel
+                     if not (MUSIC_DIR / f"{v}.opus_stream").exists()]
+        already = len(sel) - len(to_import)
+        if already:
+            self.log(f"✅ {already} lagu sudah ada lokal (skip download)")
+        if not to_import:
+            self.set_status("Semua lagu terpilih sudah ada di lokal")
+            return
+
+        n = len(to_import)
+
+        def _task():
+            exporter = GitHubExporter(
+                token=cfg['github_token'],
+                owner=cfg['github_owner'],
+                repo=cfg['github_repo'],
+                branch=cfg.get('github_branch', 'main'),
+            )
+            ok, fail = 0, 0
+            for i, vid_id in enumerate(to_import, 1):
+                r = next((x for x in self.repo_songs
+                          if x['vid_id'] == vid_id), None)
+                if not r:
+                    continue
+                title = r.get('title', vid_id)
+                self.set_status(f"⬇ Import {i}/{n}: {title[:50]}...")
+                try:
+                    # Download opus_stream
+                    opus_blob = exporter._get_repo_blob(
+                        f"{repo_dir}/{vid_id}.opus_stream")
+                    if opus_blob is None:
+                        self.log(f"❌ {title[:40]}: opus_stream tidak "
+                                 f"ditemukan di repo")
+                        fail += 1
+                        continue
+                    opus_file = MUSIC_DIR / f"{vid_id}.opus_stream"
+                    with open(opus_file, 'wb') as f:
+                        f.write(opus_blob)
+
+                    # Download meta.json
+                    meta_blob = exporter._get_repo_blob(
+                        f"{repo_dir}/{vid_id}.meta.json")
+                    meta = {}
+                    if meta_blob is not None:
+                        meta_file = MUSIC_DIR / f"{vid_id}.meta.json"
+                        with open(meta_file, 'wb') as f:
+                            f.write(meta_blob)
+                        try:
+                            meta = json.loads(meta_blob.decode('utf-8'))
+                        except Exception:
+                            meta = {}
+                    if not meta:
+                        # Buat meta minimal dari info repo tree
+                        meta = {
+                            'title': r.get('title', vid_id),
+                            'channel': r.get('channel', ''),
+                            'dur_s': int(r.get('dur_s') or 0),
+                        }
+                        with open(MUSIC_DIR / f"{vid_id}.meta.json", 'w',
+                                  encoding='utf-8') as f:
+                            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+                    ok += 1
+                    size_kb = opus_file.stat().st_size // 1024
+                    self.log(f"✅ Imported: {title[:50]} ({size_kb} KB)")
+                except Exception as e:
+                    self.log(f"❌ Import gagal {title[:40]}: {e}")
+                    fail += 1
+
+            self.after(0, self._refresh_local_list)
+            self.after(0, self._render_repo_list)
+            self.set_status(f"⬇ {ok} di-import"
+                            + (f", {fail} gagal" if fail else ""))
+            self.log(f"🎉 Import selesai: {ok} di-import, {fail} gagal")
+
+        self.run_async(_task)
+
+    def _do_catalog_sync(self):
+        """Sinkronkan catalog.json di repo sesuai semua lagu di folder repo."""
+        if self.busy:
+            return
+        cfg = self.settings
+        if not (cfg.get('github_token') and cfg.get('github_owner')
+                and cfg.get('github_repo')):
+            messagebox.showwarning(
+                "Settings belum lengkap",
+                "Isi GitHub token, owner, dan repo di Settings dulu.")
+            self._open_settings()
+            return
+        repo_dir = cfg.get('repo_dir', 'music')
+
+        def _task():
+            self.log("📋 Sinkron catalog.json dengan isi repo...")
+            self.set_status("📋 Sinkron catalog.json...")
+            try:
+                exporter = GitHubExporter(
+                    token=cfg['github_token'],
+                    owner=cfg['github_owner'],
+                    repo=cfg['github_repo'],
+                    branch=cfg.get('github_branch', 'main'),
+                )
+                cat = exporter.sync_catalog(
+                    repo_dir=repo_dir,
+                    catalog_path='catalog.json',
+                    local_file=str(BASE_DIR / 'catalog.json'),
+                )
+                self.catalog_status_var.set(
+                    f"catalog.json: sinkron ({cat['count']} tracks)")
+                self.log(f"✅ catalog.json di-sync: {cat['count']} lagu")
+                self.set_status(f"📋 catalog.json sinkron ({cat['count']} lagu)")
+            except GitHubError as e:
+                self.log(f"❌ Sinkron catalog gagal: {e}")
+                self.set_status("Sinkron catalog gagal")
+
+        self.run_async(_task)
+
     # ── Search ────────────────────────────────────────────────
     def _do_search(self):
         query = self.query_var.get().strip()
@@ -667,6 +1071,28 @@ class App(tk.Tk):
         self._update_sort_headings()
         self._refresh_local_list()
 
+    def _repo_sort_key(self, r: dict):
+        """Key sort untuk lagu repo (durasi/ukuran numerik, teks case-insensitive)."""
+        if self.repo_sort_key == 'duration':
+            return int(r.get('dur_s') or 0)
+        if self.repo_sort_key == 'size':
+            return int(r.get('size_kb') or 0)
+        return str(r.get(self.repo_sort_key, '')).lower()
+
+    def _sort_repo(self, key: str):
+        """Sort daftar lagu repo per kolom Judul/Channel/Durasi/Ukuran."""
+        if self.repo_sort_key == key:
+            self.repo_sort_reverse = not self.repo_sort_reverse
+        else:
+            self.repo_sort_key = key
+            self.repo_sort_reverse = False
+        self.repo_songs.sort(key=self._repo_sort_key,
+                             reverse=self.repo_sort_reverse)
+        arrow = '↓' if self.repo_sort_reverse else '↑'
+        self.log(f"↕ Sort repo {key} {arrow}")
+        self._update_sort_headings()
+        self._render_repo_list()
+
     def _update_sort_headings(self):
         """Tampilkan panah ↑/↓ pada kolom yang sedang di-sort."""
         results_map = {'title': 'Judul', 'channel': 'Channel',
@@ -699,6 +1125,19 @@ class App(tk.Tk):
                                     command=lambda:
                                     self._sort_local(
                                         self.local_sort_key))
+        # Reset semua heading repo
+        for k, text in local_map.items():
+            self.repo_tree.heading(k, text=text,
+                                   command=lambda k=k:
+                                   self._sort_repo(k))
+        if self.repo_sort_key:
+            text = local_map[self.repo_sort_key]
+            arrow = '↓' if self.repo_sort_reverse else '↑'
+            self.repo_tree.heading(self.repo_sort_key,
+                                   text=f"{text} {arrow}",
+                                   command=lambda:
+                                   self._sort_repo(
+                                       self.repo_sort_key))
 
     # ── Convert ───────────────────────────────────────────────
     def _on_selection_changed(self, _event=None):
@@ -713,8 +1152,11 @@ class App(tk.Tk):
     def _active_tree(self) -> ttk.Treeview:
         """Tree dari tab yang sedang aktif."""
         try:
-            if self.notebook.index(self.notebook.select()) == 1:
+            idx = self.notebook.index(self.notebook.select())
+            if idx == 1:
                 return self.local_tree
+            if idx == 2:
+                return self.repo_tree
         except Exception:
             pass
         return self.results_tree
@@ -725,6 +1167,7 @@ class App(tk.Tk):
         children = tree.get_children()
         if children:
             tree.selection_set(children)
+            self._update_buttons()
 
     def _do_convert_selected(self):
         """Convert semua lagu yang dipilih (Ctrl+klik / Shift+klik untuk banyak)."""
@@ -995,11 +1438,13 @@ class App(tk.Tk):
                     self.set_status("📋 Sinkron catalog.json...")
                     cat = exporter.sync_catalog(
                         repo_dir=repo_dir,
-                        catalog_path=f"{repo_dir}/catalog.json",
+                        catalog_path='catalog.json',
                         local_file=str(BASE_DIR / 'catalog.json'),
                     )
                     self.log(f"📋 catalog.json: {cat['count']} lagu "
                              f"tersinkron")
+                    self.catalog_status_var.set(
+                        f"catalog.json: sinkron ({cat['count']} tracks)")
                 except Exception as e:
                     self.log(f"⚠ Sinkron catalog gagal: {e}")
 

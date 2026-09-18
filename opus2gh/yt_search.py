@@ -12,11 +12,15 @@ import glob
 import hashlib
 import logging
 import os
+import sys
 from pathlib import Path
 
 logger = logging.getLogger('opus2gh.yt')
 
-THIS_DIR = Path(__file__).resolve().parent.parent
+if getattr(sys, 'frozen', False):
+    THIS_DIR = Path(sys.executable).resolve().parent
+else:
+    THIS_DIR = Path(__file__).resolve().parent.parent
 MAX_DURATION_S = 600          # tolak lagu lebih dari 10 menit
 
 
