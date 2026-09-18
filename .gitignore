@@ -1,0 +1,14 @@
+# Jangan commit kredensial
+settings.json
+
+# Cache lagu lokal
+music/.tmp/
+/dist
+/.venv
+/.venv-1
+/__pycache__
+/build
+/build
+/music
+/__pycache__
+/dist
