@@ -2,11 +2,13 @@
 """
 opus2gh — YouTube → Opus 16kbps → GitHub
 
-GUI aplikasi (2 tab + player):
+GUI aplikasi (4 tab + player):
   1. Tab Pencarian: cari lagu di YouTube → pilih → Convert ke opus_stream 16 kbps
-  2. Tab Lagu Lokal: daftar lagu yang sudah dikonversi di folder music/
-  3. Player: putar lagu lokal (opus_stream) atau YouTube online (double-click / tombol ▶)
-  4. Pilih lagu (dari tab mana saja) → Export terpilih ke GitHub repo
+  2. Tab Convert File: pilih folder file musik (semua format) → scan →
+     Convert ke opus_stream → Export ke GitHub + sync catalog.json
+  3. Tab Lagu Lokal: daftar lagu yang sudah dikonversi di folder music/
+  4. Player: putar lagu lokal (opus_stream) atau YouTube online (double-click / tombol ▶)
+  5. Pilih lagu (dari tab mana saja) → Export terpilih ke GitHub repo
 
 Format opus_stream (kompatibel xiaozhi-amls905x / mcp_music.py):
   [uint16_be: packet_len][opus_packet_bytes]...
@@ -30,9 +32,11 @@ import webbrowser
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from opus2gh import settings as settings_mgr
+from opus2gh.file_scan import (AUDIO_EXTENSIONS, fmt_size, scan_folder,
+                               song_id_for)
 from opus2gh.github_export import (GitHubError, GitHubExporter,
                                    GitHubRepoNotFoundError)
 from opus2gh.opus_codec import encode_file
@@ -70,6 +74,8 @@ class App(tk.Tk):
         self.local_songs: list[dict] = []      # lagu lokal di folder music/
         self.converted: dict[str, dict] = {}   # vid_id → {opus_file, meta_file, meta}
         self.repo_songs: list[dict] = []       # lagu di repo GitHub (tab Import)
+        self.file_songs: list[dict] = []       # hasil scan folder (tab Convert File)
+        self.file_folder: str = ''             # folder terakhir yang di-scan
         # Sort state
         self.results_sort_key: str | None = None
         self.results_sort_reverse: bool = False
@@ -77,6 +83,8 @@ class App(tk.Tk):
         self.local_sort_reverse: bool = False
         self.repo_sort_key: str | None = None
         self.repo_sort_reverse: bool = False
+        self.file_sort_key: str | None = None
+        self.file_sort_reverse: bool = False
         self.worker: threading.Thread | None = None
         self.busy = False
         self.stop_flag = threading.Event()    # stop pencarian / operasi
@@ -151,7 +159,83 @@ class App(tk.Tk):
         # Double-click → play lagu (online / lokal jika sudah ada)
         self.results_tree.bind('<Double-Button-1>',
                                self._on_results_double_click)
-        # Tab 2: Lagu Lokal
+        # Tab 2: Convert File (folder → opus_stream)
+        file_tab = ttk.Frame(self.notebook, padding=(10, 6))
+        self.notebook.add(file_tab, text="📁 Convert File")
+        file_tab.columnconfigure(1, weight=1)
+        file_tab.rowconfigure(3, weight=1)
+
+        ttk.Label(file_tab, text="Folder:").grid(
+            row=0, column=0, sticky='w')
+        self.file_folder_var = tk.StringVar()
+        file_entry = ttk.Entry(file_tab, textvariable=self.file_folder_var,
+                               state='readonly')
+        file_entry.grid(row=0, column=1, sticky='ew', padx=6)
+        self.file_browse_btn = ttk.Button(
+            file_tab, text="📂 Pilih Folder",
+            command=self._do_pick_folder)
+        self.file_browse_btn.grid(row=0, column=2, padx=(6, 0))
+        self.file_scan_btn = ttk.Button(
+            file_tab, text="🔄 Scan",
+            command=self._do_scan_folder, state='disabled')
+        self.file_scan_btn.grid(row=0, column=3, padx=(6, 0))
+
+        opt_frame = ttk.Frame(file_tab)
+        opt_frame.grid(row=1, column=0, columnspan=4, sticky='ew',
+                       pady=(4, 2))
+        self.file_recursive_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_frame, text="Sertakan subfolder",
+                        variable=self.file_recursive_var).pack(side='left')
+        self.file_count_var = tk.StringVar(value="0 file")
+        ttk.Label(opt_frame, textvariable=self.file_count_var,
+                  foreground='gray').pack(side='left', padx=8)
+        self.file_convert_btn = ttk.Button(
+            opt_frame, text="🎵 Convert Terpilih",
+            command=self._do_file_convert, state='disabled')
+        self.file_convert_btn.pack(side='right')
+        self.file_export_btn = ttk.Button(
+            opt_frame, text="⬆ Convert & Export",
+            command=self._do_file_convert_export, state='disabled')
+        self.file_export_btn.pack(side='right', padx=(0, 6))
+
+        ttk.Label(file_tab, foreground='gray',
+                  text="Pilih folder berisi file musik (semua format: "
+                       "mp3, flac, wav, m4a, ogg, mp4, dll) → scan → "
+                       "Convert ke opus_stream 16 kbps → Export ke GitHub."
+                  ).grid(row=2, column=0, columnspan=4, sticky='w',
+                         pady=(4, 2))
+
+        fcols = ('name', 'title', 'artist', 'duration', 'size', 'status')
+        self.file_tree = ttk.Treeview(file_tab, columns=fcols,
+                                      show='headings', selectmode='extended')
+        self.file_tree.heading('name', text='File',
+                               command=lambda: self._sort_file('name'))
+        self.file_tree.heading('title', text='Judul',
+                               command=lambda: self._sort_file('title'))
+        self.file_tree.heading('artist', text='Artis',
+                               command=lambda: self._sort_file('artist'))
+        self.file_tree.heading('duration', text='Durasi',
+                               command=lambda: self._sort_file('duration'))
+        self.file_tree.heading('size', text='Ukuran',
+                               command=lambda: self._sort_file('size'))
+        self.file_tree.heading('status', text='Status')
+        self.file_tree.column('name', width=220, anchor='w')
+        self.file_tree.column('title', width=220, anchor='w')
+        self.file_tree.column('artist', width=140, anchor='w')
+        self.file_tree.column('duration', width=60, anchor='center')
+        self.file_tree.column('size', width=80, anchor='e')
+        self.file_tree.column('status', width=110, anchor='center')
+        self.file_tree.grid(row=3, column=0, columnspan=4, sticky='nsew')
+
+        fscroll = ttk.Scrollbar(file_tab, orient='vertical',
+                                command=self.file_tree.yview)
+        self.file_tree.configure(yscrollcommand=fscroll.set)
+        fscroll.grid(row=3, column=4, sticky='ns')
+
+        self.file_tree.bind('<<TreeviewSelect>>',
+                            self._on_file_selection_changed)
+
+        # Tab 3: Lagu Lokal
         local_tab = ttk.Frame(self.notebook, padding=(10, 6))
         self.notebook.add(local_tab, text="🎵 Lagu Lokal")
         local_tab.columnconfigure(0, weight=1)
@@ -209,7 +293,7 @@ class App(tk.Tk):
         self.local_tree.bind('<Double-Button-1>',
                              self._on_local_double_click)
 
-        # Tab 3: Import / Kelola Repo GitHub
+        # Tab 4: Import / Kelola Repo GitHub
         repo_tab = ttk.Frame(self.notebook, padding=(10, 6))
         self.notebook.add(repo_tab, text="☁ Repo GitHub")
         repo_tab.columnconfigure(0, weight=1)
@@ -383,6 +467,18 @@ class App(tk.Tk):
         has_selection = bool(self.local_tree.selection())
         self.delete_local_btn.configure(
             state='normal' if (has_selection and not self.busy) else 'disabled')
+        # Tab Convert File: scan butuh folder; convert/export butuh selection
+        has_folder = bool(self.file_folder_var.get())
+        file_sel = bool(self.file_tree.selection())
+        self.file_scan_btn.configure(
+            state='normal' if (has_folder and not self.busy) else 'disabled')
+        self.file_browse_btn.configure(
+            state='disabled' if self.busy else 'normal')
+        self.file_convert_btn.configure(
+            state='normal' if (file_sel and not self.busy) else 'disabled')
+        self.file_export_btn.configure(
+            state='normal' if (file_sel and not self.busy and gh_ready)
+            else 'disabled')
 
     def run_async(self, fn, stoppable=False):
         """Jalankan fn di background thread dengan busy state.
@@ -565,7 +661,7 @@ class App(tk.Tk):
                                            r['duration_str'],
                                            f"{r['size_kb']} KB"))
         n = len(self.local_songs)
-        self.notebook.tab(1, text=f"🎵 Lagu Lokal ({n})")
+        self.notebook.tab(2, text=f"🎵 Lagu Lokal ({n})")
         self.local_count_var.set(f"{n} lagu tersimpan di folder music/")
         if not self.busy:
             self.set_status(f"{n} lagu lokal — pilih lalu Export, "
@@ -684,7 +780,7 @@ class App(tk.Tk):
                 self.repo_songs = songs
                 self.after(0, self._render_repo_list)
                 n = len(songs)
-                self.notebook.tab(2, text=f"☁ Repo GitHub ({n})")
+                self.notebook.tab(3, text=f"☁ Repo GitHub ({n})")
                 self.repo_count_var.set(f"{n} lagu di repo")
                 self.log(f"✅ {n} lagu ditemukan di repo")
 
@@ -802,7 +898,7 @@ class App(tk.Tk):
                 songs = exporter.list_repo_songs(repo_dir)
                 self.repo_songs = songs
                 self.after(0, self._render_repo_list)
-                self.notebook.tab(2, text=f"☁ Repo GitHub ({len(songs)})")
+                self.notebook.tab(3, text=f"☁ Repo GitHub ({len(songs)})")
                 self.repo_count_var.set(f"{len(songs)} lagu di repo")
             except Exception as e:
                 self.log(f"⚠ Gagal refresh daftar repo: {e}")
@@ -941,6 +1037,327 @@ class App(tk.Tk):
                 self.set_status("Sinkron catalog gagal")
 
         self.run_async(_task)
+
+    # ── Convert File (folder → opus_stream) ────────────────
+    def _on_file_selection_changed(self, _event=None):
+        """Selection di tab Convert File berubah → update tombol."""
+        self._update_buttons()
+        n = len(self.file_tree.selection())
+        if n == 1:
+            self.status_var.set("1 file dipilih — Convert atau Convert & Export")
+        elif n > 1:
+            self.status_var.set(f"{n} file dipilih — Convert atau Convert & Export")
+
+    def _do_pick_folder(self):
+        """Pilih folder sumber berisi file musik."""
+        if self.busy:
+            return
+        folder = filedialog.askdirectory(
+            title="Pilih folder berisi file musik",
+            initialdir=self.file_folder or str(BASE_DIR))
+        if folder:
+            self.file_folder = os.path.normpath(folder)
+            self.file_folder_var.set(self.file_folder)
+            self.log(f"📁 Folder dipilih: {self.file_folder}")
+            self._update_buttons()
+
+    def _do_scan_folder(self):
+        """Scan folder → daftar file musik (semua format)."""
+        if self.busy:
+            return
+        folder = self.file_folder_var.get()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("Folder tidak valid",
+                                   "Pilih folder yang berisi file musik dulu.")
+            return
+        recursive = self.file_recursive_var.get()
+
+        def _task():
+            self.log(f"🔄 Scan folder: {folder}"
+                     f"{' (+ subfolder)' if recursive else ''}")
+            self.set_status("🔄 Scan folder...")
+            self.file_songs = []
+            self.after(0, self._render_file_list)
+            count = 0
+            try:
+                for r in scan_folder(folder, recursive=recursive,
+                                     stop_check=self.stop_flag.is_set):
+                    # Tandai yang sudah ada di lokal (✅)
+                    r['local'] = (MUSIC_DIR / f"{r['song_id']}.opus_stream"
+                                  ).exists()
+                    self.file_songs.append(r)
+                    count += 1
+                    if self.file_sort_key:
+                        self.file_songs.sort(
+                            key=self._file_sort_key,
+                            reverse=self.file_sort_reverse)
+                    self.after(0, self._render_file_list)
+                    self.set_status(f"{count} file ditemukan — scan... "
+                                    f"(⏹ untuk stop)")
+            except Exception as e:
+                self.log(f"❌ Scan gagal: {e}")
+                self.set_status("Scan gagal")
+                return
+
+            if self.stop_flag.is_set():
+                self.set_status(f"⏹ Dihentikan — {count} file ditampilkan")
+                self.log(f"⏹ Scan dihentikan ({count} file)")
+            else:
+                self.set_status(f"{count} file siap — pilih lalu Convert "
+                                f"atau Convert & Export")
+                self.log(f"✅ {count} file musik ditemukan")
+
+        self.run_async(_task, stoppable=True)
+
+    def _render_file_list(self, keep_selection=True):
+        """Render ulang tree tab Convert File dari self.file_songs."""
+        sel = set(self.file_tree.selection()) if keep_selection else set()
+        for iid in self.file_tree.get_children():
+            self.file_tree.delete(iid)
+        for r in self.file_songs:
+            prefix = "✅ " if r.get('local') else ""
+            self.file_tree.insert(
+                '', 'end', iid=r['song_id'],
+                values=(prefix + r['name'], prefix + r['title'],
+                        r['artist'], r['duration_str'],
+                        fmt_size(r['size_bytes']), r.get('status', '')))
+        valid_sel = sel & set(self.file_tree.get_children())
+        if valid_sel:
+            self.file_tree.selection_set(list(valid_sel))
+        self.file_count_var.set(f"{len(self.file_songs)} file")
+        self._update_buttons()
+
+    def _file_sort_key(self, r: dict):
+        if self.file_sort_key == 'duration':
+            return int(r.get('dur_s') or 0)
+        if self.file_sort_key == 'size':
+            return int(r.get('size_bytes') or 0)
+        return str(r.get(self.file_sort_key, '')).lower()
+
+    def _sort_file(self, key: str):
+        """Sort daftar file tab Convert File per kolom."""
+        if self.file_sort_key == key:
+            self.file_sort_reverse = not self.file_sort_reverse
+        else:
+            self.file_sort_key = key
+            self.file_sort_reverse = False
+        self.file_songs.sort(key=self._file_sort_key,
+                             reverse=self.file_sort_reverse)
+        arrow = '↓' if self.file_sort_reverse else '↑'
+        self.log(f"↕ Sort file {key} {arrow}")
+        self._update_sort_headings()
+        self._render_file_list()
+
+    def _file_selected_songs(self) -> list[dict]:
+        """Daftar entri file yang dipilih di tab Convert File."""
+        sel = self.file_tree.selection()
+        return [r for r in self.file_songs if r['song_id'] in sel]
+
+    def _convert_file_song(self, r: dict) -> bool:
+        """Convert satu file musik → opus_stream 16 kbps. Return True sukses."""
+        song_id = r['song_id']
+        title = r.get('title') or r.get('name', song_id)
+        src = r['path']
+        if not os.path.isfile(src):
+            self.log(f"❌ File tidak ditemukan: {src}")
+            return False
+
+        self.set_status(f"🎵 Converting: {title[:50]}...")
+        self.log(f"🎵 Convert: {r.get('name')} → opus_stream 16 kbps")
+        opus_file = MUSIC_DIR / f"{song_id}.opus_stream"
+        ok = encode_file(src, str(opus_file), str(TMP_DIR))
+        if not ok:
+            self.log(f"❌ Convert gagal: {r.get('name')}")
+            r['status'] = "❌ gagal"
+            self._set_file_status(song_id, r['status'])
+            return False
+
+        meta = {
+            'title': title,
+            'channel': r.get('artist', ''),
+            'dur_s': int(r.get('dur_s') or 0),
+            'source': 'file',
+            'source_file': r.get('name', ''),
+        }
+        meta_file = MUSIC_DIR / f'{song_id}.meta.json'
+        with open(meta_file, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        size_kb = opus_file.stat().st_size // 1024
+        self.log(f"✅ Saved: {opus_file.name} ({size_kb} KB)")
+        r['status'] = "✅ siap"
+        self._set_file_status(song_id, r['status'])
+
+        # Register untuk export
+        self.converted[song_id] = {
+            'opus_file': str(opus_file),
+            'meta_file': str(meta_file),
+            'meta': meta,
+        }
+        r['local'] = True
+        self.after(0, self._refresh_local_list)
+        return True
+
+    def _set_file_status(self, song_id: str, status: str):
+        """Update kolom Status baris file di tab Convert File."""
+        def _upd():
+            for iid in self.file_tree.get_children():
+                if iid == song_id:
+                    vals = list(self.file_tree.item(iid, 'values'))
+                    if len(vals) >= 6:
+                        vals[5] = status
+                        self.file_tree.item(iid, values=vals)
+                    break
+        self.after(0, _upd)
+
+    def _run_file_convert(self, songs: list[dict], export: bool):
+        """Worker: convert daftar file (→ export ke GitHub + sync catalog)."""
+        cfg = self.settings
+        total = len(songs)
+        ok_count = 0
+        for i, r in enumerate(songs, 1):
+            if self.stop_flag.is_set():
+                self.log(f"⏹ Convert dihentikan ({ok_count}/{total} selesai)")
+                break
+            self.set_status(f"[{i}/{total}] {r.get('name', '')[:50]}")
+            try:
+                if self._convert_file_song(r):
+                    ok_count += 1
+            except Exception as e:
+                self.log(f"❌ {r.get('name')}: {e}")
+
+        self.after(0, self._render_file_list)
+        if not ok_count:
+            self.set_status("Tidak ada file berhasil dikonversi")
+            return
+
+        if not export:
+            self.set_status(f"✅ Convert selesai: {ok_count}/{total} file")
+            self.log(f"🎉 Convert selesai: {ok_count}/{total} file")
+            return
+
+        # ── Export ke GitHub ──
+        if not (cfg.get('github_token') and cfg.get('github_owner')
+                and cfg.get('github_repo')):
+            self.log("⚠ Settings GitHub belum lengkap — file dikonversi "
+                     "tapi tidak di-export")
+            self.set_status(f"✅ {ok_count}/{total} dikonversi — "
+                            f"isi Settings GitHub untuk export")
+            return
+
+        repo_dir = cfg.get('repo_dir', 'music')
+        exporter = GitHubExporter(
+            token=cfg['github_token'],
+            owner=cfg['github_owner'],
+            repo=cfg['github_repo'],
+            branch=cfg.get('github_branch', 'main'),
+        )
+        up_ok, up_skip, up_fail = 0, 0, 0
+        for i, r in enumerate(songs, 1):
+            song_id = r['song_id']
+            rec = self.converted.get(song_id)
+            if not rec:
+                continue
+            title = rec['meta'].get('title', song_id)
+            self.set_status(f"⬆ Export {i}/{total}: {title[:50]}...")
+            try:
+                result = exporter.upload_song(
+                    rec['opus_file'], rec['meta_file'],
+                    repo_dir=repo_dir,
+                    commit_message=f"music: add {song_id}",
+                )
+                if result.get('skipped'):
+                    self.log(f"⏭ Sudah ada (identik) → {result['opus_path']}")
+                    up_skip += 1
+                    self._set_file_status(song_id, "⏭ sama")
+                else:
+                    self.log(f"✅ Uploaded → {result['opus_path']}")
+                    up_ok += 1
+                    self._set_file_status(song_id, "⬆ terkirim")
+            except Exception as e:
+                self.log(f"❌ Export gagal {title[:40]}: {e}")
+                up_fail += 1
+                self._set_file_status(song_id, "❌ gagal")
+
+        # ── Sync catalog.json di root repo dengan file baru ──
+        if up_ok:
+            try:
+                self.set_status("📋 Sinkron catalog.json...")
+                cat = exporter.sync_catalog(
+                    repo_dir=repo_dir,
+                    catalog_path='catalog.json',
+                    local_file=str(BASE_DIR / 'catalog.json'),
+                    commit_message=f"catalog: sync after file import "
+                                   f"({up_ok} added)",
+                )
+                self.log(f"📋 catalog.json di-sync: {cat['count']} lagu")
+                self.catalog_status_var.set(
+                    f"catalog.json: sinkron ({cat['count']} tracks)")
+            except Exception as e:
+                self.log(f"⚠ Sinkron catalog gagal: {e}")
+
+        self.set_status(
+            f"✅ {ok_count}/{total} dikonversi, {up_ok} di-upload "
+            f"({up_skip} skip) → {cfg['github_owner']}/"
+            f"{cfg['github_repo']}")
+        self.log(f"🎉 Export selesai: {up_ok} baru, {up_skip} skip, "
+                 f"{up_fail} gagal")
+        if up_ok:
+            url = (f"https://github.com/{cfg['github_owner']}/"
+                   f"{cfg['github_repo']}/tree/"
+                   f"{cfg.get('github_branch', 'main')}/{repo_dir}")
+            self.log(f"🔗 {url}")
+
+    def _do_file_convert(self):
+        """Convert file terpilih ke opus_stream (tanpa export)."""
+        if self.busy:
+            return
+        songs = self._file_selected_songs()
+        if not songs:
+            messagebox.showinfo(
+                "Info", "Pilih file dulu di tab 'Convert File'.\n"
+                "Klik untuk satu, Ctrl+klik / Shift+klik untuk banyak.")
+            return
+        songs = [r for r in songs if not r.get('local')]
+        if not songs:
+            self.set_status("Semua file terpilih sudah dikonversi")
+            return
+        total = len(songs)
+        self.log(f"🎵 Convert {total} file ke opus_stream...")
+        self.run_async(lambda: self._run_file_convert(songs, export=False),
+                       stoppable=True)
+
+    def _do_file_convert_export(self):
+        """Convert file terpilih ke opus_stream lalu export ke GitHub."""
+        if self.busy:
+            return
+        cfg = self.settings
+        if not (cfg.get('github_token') and cfg.get('github_owner')
+                and cfg.get('github_repo')):
+            messagebox.showwarning(
+                "Settings belum lengkap",
+                "Isi GitHub token, owner, dan repo di Settings dulu.")
+            self._open_settings()
+            return
+        songs = self._file_selected_songs()
+        if not songs:
+            messagebox.showinfo(
+                "Info", "Pilih file dulu di tab 'Convert File'.\n"
+                "Klik untuk satu, Ctrl+klik / Shift+klik untuk banyak.")
+            return
+        to_convert = [r for r in songs if not r.get('local')]
+        already = len(songs) - len(to_convert)
+        if already:
+            self.log(f"✅ {already} file sudah dikonversi (langsung di-export)")
+        if not to_convert:
+            self.set_status("Semua file terpilih sudah dikonversi — export saja")
+            self.run_async(lambda: self._run_file_convert(songs, export=True),
+                           stoppable=True)
+            return
+        total = len(to_convert)
+        self.log(f"🎵 Convert {total} file → opus_stream → GitHub...")
+        self.run_async(lambda: self._run_file_convert(to_convert, export=True),
+                       stoppable=True)
 
     # ── Search ────────────────────────────────────────────────
     def _do_search(self):
@@ -1099,6 +1516,8 @@ class App(tk.Tk):
                        'duration': 'Durasi'}
         local_map = {'title': 'Judul', 'channel': 'Channel',
                      'duration': 'Durasi', 'size': 'Ukuran'}
+        file_map = {'name': 'File', 'title': 'Judul', 'artist': 'Artis',
+                    'duration': 'Durasi', 'size': 'Ukuran'}
         # Reset semua heading hasil
         for k, text in results_map.items():
             self.results_tree.heading(k, text=text,
@@ -1138,6 +1557,19 @@ class App(tk.Tk):
                                    command=lambda:
                                    self._sort_repo(
                                        self.repo_sort_key))
+        # Reset semua heading file (tab Convert File)
+        for k, text in file_map.items():
+            self.file_tree.heading(k, text=text,
+                                   command=lambda k=k:
+                                   self._sort_file(k))
+        if self.file_sort_key:
+            text = file_map[self.file_sort_key]
+            arrow = '↓' if self.file_sort_reverse else '↑'
+            self.file_tree.heading(self.file_sort_key,
+                                   text=f"{text} {arrow}",
+                                   command=lambda:
+                                   self._sort_file(
+                                       self.file_sort_key))
 
     # ── Convert ───────────────────────────────────────────────
     def _on_selection_changed(self, _event=None):
@@ -1154,8 +1586,10 @@ class App(tk.Tk):
         try:
             idx = self.notebook.index(self.notebook.select())
             if idx == 1:
-                return self.local_tree
+                return self.file_tree
             if idx == 2:
+                return self.local_tree
+            if idx == 3:
                 return self.repo_tree
         except Exception:
             pass

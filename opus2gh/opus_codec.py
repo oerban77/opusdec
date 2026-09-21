@@ -73,6 +73,25 @@ def find_ffmpeg() -> str:
 FFMPEG = find_ffmpeg()
 
 
+def find_ffprobe() -> str:
+    """Cari executable ffprobe di folder yang sama dengan ffmpeg, fallback PATH."""
+    d = os.path.dirname(FFMPEG)
+    name = 'ffprobe.exe' if system == 'Windows' else 'ffprobe'
+    if d:
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    bundled = _bundled_bin_dir()
+    if bundled:
+        p = os.path.join(bundled, name)
+        if os.path.isfile(p):
+            return p
+    return shutil.which('ffprobe') or 'ffprobe'
+
+
+FFPROBE = find_ffprobe()
+
+
 def _find_opus_dll_dirs() -> list[str]:
     """Cari folder yang berisi opus.dll / libopus (untuk opuslib via ctypes)."""
     this_dir = Path(__file__).resolve().parent.parent

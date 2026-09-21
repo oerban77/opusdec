@@ -8,6 +8,13 @@ lalu mengekspornya beserta metadata-nya ke GitHub repository.
 
 - 🔍 **Cari lagu di YouTube** — masukkan judul lagu atau nama penyanyi,
   hasil pencarian ditampilkan dalam list
+- 📁 **Convert File** — konversi file musik lokal (semua format: mp3, flac,
+  wav, m4a, ogg, mp4, dll) ke opus_stream 16 kbps:
+  - 📂 **Pilih Folder** → 🔄 **Scan** (metadata diambil via ffprobe, file
+    yang sudah dikonversi ditandai ✅)
+  - 🎵 **Convert Terpilih** — convert saja ke folder `music/`
+  - ⬆ **Convert & Export** — convert + upload ke GitHub, lalu
+    `catalog.json` di root repo di-sync otomatis dengan file baru
 - 🎵 **Convert ke Opus 16 kbps** — pilih lagu dari list, otomatis
   didownload & dikonversi (16 kHz mono, frame 60 ms)
 - ⬆ **Export ke GitHub** — lagu (`.opus_stream`) + metadata (`.meta.json`)
@@ -63,12 +70,13 @@ python app.py
 app.py                  # GUI utama (Tkinter)
 opus2gh/
   yt_search.py          # Pencarian & download YouTube (yt-dlp)
+  file_scan.py          # Scan folder file musik (semua format) via ffprobe
   opus_codec.py         # Konversi PCM → opus_stream 16 kbps
   github_export.py      # Export ke GitHub via REST API
   settings.py           # Settings manager (settings.json)
 music/                  # Cache lokal lagu hasil konversi
-  <video_id>.opus_stream
-  <video_id>.meta.json
+  <song_id>.opus_stream
+  <song_id>.meta.json
 ```
 
 ## Anti-bot YouTube
