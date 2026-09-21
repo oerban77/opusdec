@@ -104,8 +104,7 @@ Yang **tetap di luar** exe (dibuat otomatis di samping exe saat dijalankan):
 |---|---|
 | `settings.json` | Konfigurasi GitHub (token, owner, repo, branch) |
 | `music/` | Cache lagu hasil konversi |
-| `catalog.json` | Hasil sync katalog repo (berada di **root repo**,
-bukan di folder `music/`) |
+| `catalog.json` | Hasil sync katalog repo (berada di **root repo**, bukan di folder `music/`) |
 | `cookies.txt` | Opsional, anti-bot YouTube |
 
 > Jika lokasi `ffmpeg` atau `opus.dll` berbeda, set environment variable
